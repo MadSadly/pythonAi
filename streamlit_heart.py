@@ -14,6 +14,7 @@ import streamlit as st
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
+from sklearn.linear_model import LogisticRegression
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "dataset" / "heart_disease_uci_korean.csv"
@@ -24,7 +25,7 @@ SCALER_PATH = MODEL_DIR / "heart_scaler.pkl"
 
 DROP_COLS = ["주요 혈관 수", "심장 혈류 상태"]
 # notebook에서 0을 '미기록/결측'으로 보고 NaN 처리한 컬럼들
-COLS_TO_FIX = ["안정 시 혈압", "콜레스테롤", "나이", "최대 심박수"]
+COLS_TO_FIX = ["안정 시 혈압", "콜레스테롤", "최대 심박수"]
 
 # 사용자 입력 대상 (타겟·삭제 컬럼 제외)
 INPUT_FEATURE_COLS = [
@@ -100,9 +101,7 @@ def load_or_train_model():
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # 파일이 없을 때만 fallback으로 학습(정확한 GridSearch는 notebook에서 수행 권장)
-    from sklearn.ensemble import RandomForestClassifier
-    model = RandomForestClassifier(n_estimators=500, max_depth=10, min_samples_leaf=3, random_state=42)
+    model = LogisticRegression(max_iter=5000, random_state=42)
     model.fit(X_train, y_train)
 
     joblib.dump(model, MODEL_PATH)
