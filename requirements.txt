@@ -1,0 +1,19 @@
+# 데이터·수치
+numpy==2.1.3
+pandas==2.3.3
+scipy==1.15.3
+
+# 머신러닝
+scikit-learn==1.7.2
+xgboost==3.2.0
+joblib==1.5.3
+
+# 시각화
+matplotlib==3.10.8
+seaborn==0.13.2
+
+# Streamlit 앱
+streamlit==1.55.0
+
+# Jupyter / 노트북 실행용
+ipykernel==7.2.0
