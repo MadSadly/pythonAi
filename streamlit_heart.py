@@ -11,18 +11,20 @@ import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "dataset" / "heart_disease_uci_korean.csv"
 MODEL_DIR = BASE_DIR / "model"
 MODEL_PATH = MODEL_DIR / "heart_model.pkl"
 ENC_PATH = MODEL_DIR / "heart_encoders.pkl"
+SCALER_PATH = MODEL_DIR / "heart_scaler.pkl"
 
 DROP_COLS = ["주요 혈관 수", "심장 혈류 상태"]
-COLS_TO_FIX = ["안정 시 혈압", "나이", "최대 심박수"]
+# notebook에서 0을 '미기록/결측'으로 보고 NaN 처리한 컬럼들
+COLS_TO_FIX = ["안정 시 혈압", "콜레스테롤", "나이", "최대 심박수"]
 
 # 사용자 입력 대상 (타겟·삭제 컬럼 제외)
 INPUT_FEATURE_COLS = [
@@ -41,14 +43,13 @@ INPUT_FEATURE_COLS = [
 
 
 def _run_notebook_pipeline(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, LabelEncoder]]:
-    """노트북과 동일: 결측·파생·타겟·라벨 인코딩까지 (df는 이미 DROP_COLS 제거된 상태)."""
     df = df.copy()
     for col in COLS_TO_FIX:
         df[col] = df[col].replace(0, np.nan)
 
     numeric_cols = df.select_dtypes(include=["float64", "int64"]).columns
     for col in numeric_cols:
-        df[col] = df[col].fillna(df[col].mean())
+        df[col] = df[col].fillna(df[col].median())
 
     object_cols = df.select_dtypes(include=["object"]).columns
     for col in object_cols:
@@ -62,7 +63,11 @@ def _run_notebook_pipeline(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, La
     df["나이 대비 혈압 비율"] = df["안정 시 혈압"] / df["나이"]
     df["고령자 여부"] = (df["나이"] >= 60).astype(int)
     df["최대 심박수 대비 현재 혈압 비율"] = df["최대 심박수"] / df["안정 시 혈압"]
-    df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+    # 파생변수(비율)에서 inf가 발생할 수 있으므로 해당 컬럼만 median으로 보정
+    for _col in ["나이 대비 혈압 비율", "최대 심박수 대비 현재 혈압 비율"]:
+        df[_col] = df[_col].replace([np.inf, -np.inf], np.nan)
+        df[_col] = df[_col].fillna(df[_col].median())
+        df[_col] = df[_col].fillna(0)
     df["target"] = (df["심장병 진단 결과"] > 0).astype(int)
 
     encoders: dict[str, LabelEncoder] = {}
@@ -76,10 +81,14 @@ def _run_notebook_pipeline(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, La
 
 
 @functools.lru_cache(maxsize=1)
-def load_or_train_model() -> tuple[RandomForestClassifier, dict[str, LabelEncoder]]:
+def load_or_train_model():
+   
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     if MODEL_PATH.exists() and ENC_PATH.exists():
-        return joblib.load(MODEL_PATH), joblib.load(ENC_PATH)
+        model = joblib.load(MODEL_PATH)
+        encoders = joblib.load(ENC_PATH)
+        scaler = joblib.load(SCALER_PATH) if SCALER_PATH.exists() else None
+        return model, encoders, scaler
 
     df = pd.read_csv(DATA_PATH, encoding="cp949")
     df = df.drop(columns=DROP_COLS)
@@ -91,22 +100,18 @@ def load_or_train_model() -> tuple[RandomForestClassifier, dict[str, LabelEncode
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    model = RandomForestClassifier(
-        n_estimators=500,
-        max_depth=10,
-        min_samples_leaf=3,
-        random_state=42,
-    )
+    # 파일이 없을 때만 fallback으로 학습(정확한 GridSearch는 notebook에서 수행 권장)
+    from sklearn.ensemble import RandomForestClassifier
+    model = RandomForestClassifier(n_estimators=500, max_depth=10, min_samples_leaf=3, random_state=42)
     model.fit(X_train, y_train)
 
     joblib.dump(model, MODEL_PATH)
     joblib.dump(encoders, ENC_PATH)
-    return model, encoders
+    return model, encoders, None
 
 
 @functools.lru_cache(maxsize=1)
 def load_training_frame_for_stats() -> pd.DataFrame:
-    """평균·최빈값은 학습 데이터와 동일한 방식으로 계산."""
     df = pd.read_csv(DATA_PATH, encoding="cp949")
     df = df.drop(columns=DROP_COLS)
     for col in COLS_TO_FIX:
@@ -116,22 +121,21 @@ def load_training_frame_for_stats() -> pd.DataFrame:
 
 def _fill_stats_from_training() -> tuple[pd.Series, dict[str, object]]:
     df = load_training_frame_for_stats()
-    num_means = df.select_dtypes(include=["float64", "int64"]).mean()
+    num_medians = df.select_dtypes(include=["float64", "int64"]).median()
     obj_modes = {c: df[c].mode(dropna=True).iloc[0] for c in df.select_dtypes(include=["object"]).columns}
-    return num_means, obj_modes
+    return num_medians, obj_modes
 
 
 def build_single_row_from_inputs(user: dict) -> pd.DataFrame:
-    """사용자 입력 1행 → 노트북과 동일 전처리·인코딩 (심장병 진단 결과 없음)."""
-    model, encoders = load_or_train_model()
-    num_means, obj_modes = _fill_stats_from_training()
+    _, encoders, _ = load_or_train_model()
+    num_medians, obj_modes = _fill_stats_from_training()
 
     df = pd.DataFrame([user])
     for col in COLS_TO_FIX:
         df[col] = df[col].replace(0, np.nan)
 
     for col in df.select_dtypes(include=["float64", "int64"]).columns:
-        df[col] = df[col].fillna(num_means[col])
+        df[col] = df[col].fillna(num_medians[col])
     for col in df.select_dtypes(include=["object"]).columns:
         df[col] = df[col].fillna(obj_modes[col])
 
@@ -142,7 +146,11 @@ def build_single_row_from_inputs(user: dict) -> pd.DataFrame:
     df["나이 대비 혈압 비율"] = df["안정 시 혈압"] / df["나이"]
     df["고령자 여부"] = (df["나이"] >= 60).astype(int)
     df["최대 심박수 대비 현재 혈압 비율"] = df["최대 심박수"] / df["안정 시 혈압"]
-    df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+    # 파생변수(비율)에서 inf가 발생할 수 있으므로 해당 컬럼만 median으로 보정
+    for _col in ["나이 대비 혈압 비율", "최대 심박수 대비 현재 혈압 비율"]:
+        df[_col] = df[_col].replace([np.inf, -np.inf], np.nan)
+        df[_col] = df[_col].fillna(df[_col].median())
+        df[_col] = df[_col].fillna(0)
 
     for col in df.select_dtypes(include=["object"]).columns:
         df[col] = encoders[col].transform(df[col].astype(str))
@@ -153,13 +161,110 @@ def build_single_row_from_inputs(user: dict) -> pd.DataFrame:
 def main() -> None:
     st.set_page_config(page_title="심장질환 위험 예측", layout="wide")
     st.title("심장질환 위험 예측")
-    st.caption("노트북 `김민수_머신러닝과제.ipynb`와 동일한 전처리·RandomForest 설정을 사용합니다.")
 
     if not DATA_PATH.exists():
         st.error(f"데이터 파일을 찾을 수 없습니다: {DATA_PATH}")
         return
 
-    model, encoders = load_or_train_model()
+    model, encoders, scaler = load_or_train_model()
+
+    st.sidebar.title("메뉴")
+    page = st.sidebar.radio("페이지 선택", ["예측하기", "상세 데이터 분석"])
+
+    if page == "상세 데이터 분석":
+        # 1) 검증 정확도(Accuracy) 계산
+        num_medians, obj_modes = _fill_stats_from_training()
+
+        df_raw = pd.read_csv(DATA_PATH, encoding="cp949")
+        df_raw = df_raw.drop(columns=DROP_COLS)
+
+        for col in COLS_TO_FIX:
+            if col in df_raw.columns:
+                df_raw[col] = df_raw[col].replace(0, np.nan)
+
+        # 결측치 채우기(노트북과 동일한 방식: 수치 median / 범주 최빈값)
+        numeric_cols = df_raw.select_dtypes(include=["float64", "int64"]).columns
+        for col in numeric_cols:
+            if col in num_medians.index:
+                df_raw[col] = df_raw[col].fillna(num_medians[col])
+
+        object_cols = df_raw.select_dtypes(include=["object"]).columns
+        for col in object_cols:
+            if col in obj_modes:
+                df_raw[col] = df_raw[col].fillna(obj_modes[col])
+
+        # 파생변수 생성
+        df_raw["나이 대비 혈압 비율"] = df_raw["안정 시 혈압"] / df_raw["나이"]
+        df_raw["고령자 여부"] = (df_raw["나이"] >= 60).astype(int)
+        df_raw["최대 심박수 대비 현재 혈압 비율"] = df_raw["최대 심박수"] / df_raw["안정 시 혈압"]
+
+        # 비율 파생변수 inf/NaN 정리
+        for _col in ["나이 대비 혈압 비율", "최대 심박수 대비 현재 혈압 비율"]:
+            df_raw[_col] = df_raw[_col].replace([np.inf, -np.inf], np.nan)
+            df_raw[_col] = df_raw[_col].fillna(df_raw[_col].median())
+            df_raw[_col] = df_raw[_col].fillna(0)
+
+        # 타겟 생성
+        df_raw["target"] = (df_raw["심장병 진단 결과"] > 0).astype(int)
+
+        # 범주형 인코딩(저장된 encoders를 그대로 사용)
+        for col in df_raw.select_dtypes(include=["object"]).columns:
+            if col in encoders:
+                df_raw[col] = encoders[col].transform(df_raw[col].astype(str))
+
+        X = df_raw.drop(columns=["심장병 진단 결과", "target"])
+        y = df_raw["target"]
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+
+        # 스케일러 적용(로지스틱 회귀용)
+        if scaler is not None:
+            if hasattr(scaler, "feature_names_in_"):
+                X_test = X_test.reindex(columns=list(scaler.feature_names_in_), fill_value=0)
+            X_test_scaled = scaler.transform(X_test)
+        else:
+            X_test_scaled = X_test
+
+        y_pred = model.predict(X_test_scaled)
+        acc = accuracy_score(y_test, y_pred)
+
+        st.subheader("모델 검증 결과")
+        st.metric("Accuracy (테스트 세트)", f"{acc:.4f}")
+
+        st.divider()
+
+        # 2) 분류에 중요한 변수 Top 2
+        st.subheader("분류에 중요한 변수 Top 2")
+
+        if hasattr(model, "coef_"):
+            if scaler is not None and hasattr(scaler, "feature_names_in_"):
+                feature_names = list(scaler.feature_names_in_)
+            else:
+                feature_names = list(X.columns)
+
+            coef_abs = pd.Series(np.abs(model.coef_[0]), index=feature_names)
+            top2 = coef_abs.sort_values(ascending=False).head(2)
+        elif hasattr(model, "feature_importances_"):
+            feature_names = list(X.columns)
+            imp = pd.Series(model.feature_importances_, index=feature_names)
+            top2 = imp.sort_values(ascending=False).head(2)
+        else:
+            top2 = pd.Series(dtype=float)
+
+        if len(top2) == 0:
+            st.warning("중요 변수 계산이 불가능한 모델 형태입니다.")
+        else:
+            top2_df = top2.reset_index()
+            top2_df.columns = ["변수", "중요도(계수 절댓값/중요도)"]
+            st.dataframe(top2_df, use_container_width=True)
+            st.bar_chart(top2)
+
+            st.caption("로지스틱 회귀의 경우 계수 절댓값 기준으로 Top 2를 산출했습니다.")
+
+        st.info("상세 데이터 분석은 교육·과제용으로, 입력 값에 대한 개인별 설명이 아닌 전체 데이터 기반 요약입니다.")
+        return
 
     st.subheader("환자 정보 입력")
     cols = st.columns(2)
@@ -196,23 +301,26 @@ def main() -> None:
 
     if st.button("예측하기", type="primary"):
         X_one = build_single_row_from_inputs(user)
-        proba = model.predict_proba(X_one)[0]
-        pred = int(model.predict(X_one)[0])
+        # notebook이 LogisticRegression(GridSearch + StandardScaler)로 학습했다면 scaler를 적용해야 함
+        # 또한 StandardScaler가 fit된 컬럼 순서와 동일해야 하므로 reindex로 맞춤.
+        if scaler is not None:
+            if hasattr(scaler, "feature_names_in_"):
+                X_one = X_one.reindex(columns=list(scaler.feature_names_in_), fill_value=0)
+            X_in = scaler.transform(X_one)
+        else:
+            X_in = X_one
+        proba = model.predict_proba(X_in)[0]
+        pred = int(model.predict(X_in)[0])
 
         st.subheader("예측 결과")
-        label = "질환 위험(양성) 가능성이 상대적으로 높음" if pred == 1 else "정상(음성)에 가까운 패턴"
-        st.success(f"**예측 클래스:** {'질환 의심 (1)' if pred == 1 else '정상 (0)'} — {label}")
-        st.write(f"**질환(1) 확률:** {proba[1]:.1%}  |  **정상(0) 확률:** {proba[0]:.1%}")
+        label = "질환 위험 가능성이 상대적으로 높음" if pred == 1 else "정상에 가까운 패턴"
+        st.success(f"**예측 클래스:** {'질환 의심' if pred == 1 else '정상 '} — {label}")
+        st.write(f"**질환 확률:** {proba[1]:.1%}  |  **정상 확률:** {proba[0]:.1%}")
 
-        with st.expander("전처리 후 특성 벡터 (14차원)"):
+        with st.expander("입력된 정보를 확인하세요"):
             st.dataframe(X_one, use_container_width=True)
 
     st.divider()
-    st.info(
-        "교육·과제용 참고 모델이며 실제 의료 진단을 대체하지 않습니다. "
-        "모델 파일이 없으면 첫 실행 시 데이터로 학습 후 `model/`에 저장합니다."
-    )
-
 
 if __name__ == "__main__":
     main()
