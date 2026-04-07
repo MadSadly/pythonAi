@@ -1,7 +1,3 @@
-"""
-심장질환 위험 예측 (김민수_머신러닝과제.ipynb 파이프라인과 동일)
-실행: streamlit run streamlit_heart.py
-"""
 from __future__ import annotations
 
 import functools
